@@ -46,10 +46,8 @@ class EmailChecker {
             $results['total_failed'] += $accountResult['failed'];
         }
 
-        // Update last check time
         update_option( 'fsep_last_check', current_time( 'timestamp' ) );
 
-        // Log results if debug mode
         if ( ! empty( $settings['debug_mode'] ) ) {
             error_log( sprintf(
                 '[Fluent Support Email Piping] Checked %d accounts, processed %d emails (%d success, %d failed)',
@@ -90,6 +88,57 @@ class EmailChecker {
     }
 
     /**
+     * Process an email directly via ByMailHandler (no HTTP loopback).
+     *
+     * @param array $emailData Parsed email from Fetcher
+     * @param \FluentSupport\App\Models\MailBox $mailbox
+     * @return array{success: bool, message: string}
+     */
+    private function processEmailDirect( array $emailData, $mailbox ): array {
+        $payload = Sender::buildPayload( $emailData );
+        $mimeId  = $payload['mime_id'] ?? '';
+
+        try {
+            $response = \FluentSupportPro\App\Services\Integrations\FluentEmailPiping\ByMailHandler::processPayload(
+                $payload,
+                $mailbox,
+                $mimeId
+            );
+        } catch ( \Throwable $e ) {
+            return [
+                'success' => false,
+                'message' => 'Exception: ' . $e->getMessage(),
+            ];
+        }
+
+        if ( is_wp_error( $response ) ) {
+            return [
+                'success' => false,
+                'message' => $response->get_error_code() . ': ' . $response->get_error_message(),
+            ];
+        }
+
+        if ( false === $response ) {
+            return [
+                'success' => true,
+                'message' => 'Duplicate skipped',
+            ];
+        }
+
+        if ( is_array( $response ) && isset( $response['type'] ) ) {
+            return [
+                'success' => true,
+                'message' => $response['type'],
+            ];
+        }
+
+        return [
+            'success' => true,
+            'message' => 'Processed',
+        ];
+    }
+
+    /**
      * Check a single email account
      *
      * @param int $accountId
@@ -105,13 +154,11 @@ class EmailChecker {
             'errors'    => [],
         ];
 
-        // Validate account config
         if ( empty( $account['host'] ) || empty( $account['username'] ) || empty( $account['password'] ) ) {
             $result['errors'][] = __( 'Incomplete account configuration', 'fluent-support-email-piping' );
             return $result;
         }
 
-        // Get mailbox ID and webhook URL
         $mailboxId = $account['mailbox_id'] ?? 0;
 
         if ( ! $mailboxId ) {
@@ -119,15 +166,25 @@ class EmailChecker {
             return $result;
         }
 
-        $webhookUrl = Sender::getWebhookUrlForMailbox( $mailboxId );
+        $canCallDirect = class_exists( '\\FluentSupportPro\\App\\Services\\Integrations\\FluentEmailPiping\\ByMailHandler' )
+            && class_exists( '\\FluentSupport\\App\\Models\\MailBox' );
 
-        if ( ! $webhookUrl ) {
-            $result['errors'][] = __( 'Could not get webhook URL for mailbox', 'fluent-support-email-piping' );
-            return $result;
+        $mailbox = null;
+        if ( $canCallDirect ) {
+            $mailbox = \FluentSupport\App\Models\MailBox::find( $mailboxId );
+            if ( ! $mailbox ) {
+                $result['errors'][] = __( 'Fluent Support mailbox not found', 'fluent-support-email-piping' );
+                return $result;
+            }
+        } else {
+            $webhookUrl = Sender::getWebhookUrlForMailbox( $mailboxId );
+            if ( ! $webhookUrl ) {
+                $result['errors'][] = __( 'Could not get webhook URL for mailbox', 'fluent-support-email-piping' );
+                return $result;
+            }
         }
 
         try {
-            // Fetch emails
             $fetcher = new Fetcher( $account );
             $limit = $account['fetch_limit'] ?? 10;
             $emails = $fetcher->fetchEmails( $limit );
@@ -136,38 +193,43 @@ class EmailChecker {
                 return $result;
             }
 
-            // Send each email to webhook
-            $sender = new Sender( $webhookUrl );
+            $sender = null;
+            if ( ! $canCallDirect ) {
+                $sender = new Sender( $webhookUrl );
+            }
+
             $deleteAfter = ! empty( $settings['delete_after_import'] );
 
             foreach ( $emails as $email ) {
                 $result['processed']++;
 
-                $sendResult = $sender->send( $email );
+                if ( $canCallDirect && $mailbox ) {
+                    $sendResult = $this->processEmailDirect( $email, $mailbox );
+                } else {
+                    $sendResult = $sender->send( $email );
+                }
 
                 if ( $sendResult['success'] ) {
                     $result['success']++;
 
-                    // Mark as read or delete
                     if ( $deleteAfter ) {
                         $fetcher->deleteEmail( $email['mail_id'] );
                     } else {
                         $fetcher->markAsRead( $email['mail_id'] );
                     }
 
-                    // Log success
                     $this->logProcessedEmail( $accountId, $email, 'success' );
                 } else {
                     $result['failed']++;
+                    $errorMsg = $sendResult['message'] ?? 'Unknown error';
                     $result['errors'][] = sprintf(
                         /* translators: 1: email subject, 2: error message */
                         __( 'Failed to process "%1$s": %2$s', 'fluent-support-email-piping' ),
                         $email['subject'] ?? 'Unknown',
-                        $sendResult['message'] ?? 'Unknown error'
+                        $errorMsg
                     );
 
-                    // Log failure
-                    $this->logProcessedEmail( $accountId, $email, 'failed', $sendResult['message'] ?? '' );
+                    $this->logProcessedEmail( $accountId, $email, 'failed', $errorMsg );
                 }
             }
 

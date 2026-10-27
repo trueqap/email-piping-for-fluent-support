@@ -28,17 +28,15 @@ class Sender {
      * @return array Result with success status
      */
     public function send( array $emailData ): array {
-        // Format payload for Fluent Support
-        $payload = $this->formatPayload( $emailData );
+        $payload = self::buildPayload( $emailData );
 
-        // Debug log
         $this->log( 'Sending to webhook: ' . $this->webhookUrl );
         $this->log( 'Payload: ' . wp_json_encode( $payload ) );
 
-        // Send to webhook
         $response = wp_remote_post( $this->webhookUrl, [
             'method'    => 'POST',
             'timeout'   => 30,
+            'sslverify' => false,
             'headers'   => [
                 'Content-Type' => 'application/x-www-form-urlencoded',
             ],
@@ -48,10 +46,11 @@ class Sender {
         ] );
 
         if ( is_wp_error( $response ) ) {
-            $this->log( 'WP Error: ' . $response->get_error_message() );
+            $errorMsg = 'WP HTTP Error: ' . $response->get_error_message();
+            $this->log( $errorMsg );
             return [
                 'success' => false,
-                'message' => $response->get_error_message(),
+                'message' => $errorMsg,
             ];
         }
 
@@ -69,9 +68,16 @@ class Sender {
             ];
         }
 
+        $message = sprintf( 'HTTP %d', $responseCode );
+        if ( is_array( $responseData ) && ! empty( $responseData['message'] ) ) {
+            $message .= ': ' . $responseData['message'];
+        } elseif ( ! empty( $responseBody ) ) {
+            $message .= ': ' . mb_substr( strip_tags( $responseBody ), 0, 200 );
+        }
+
         return [
             'success' => false,
-            'message' => $responseData['message'] ?? __( 'Unknown error', 'fluent-support-email-piping' ),
+            'message' => $message,
             'code'    => $responseCode,
         ];
     }
@@ -89,13 +95,12 @@ class Sender {
     }
 
     /**
-     * Format email data for Fluent Support webhook
+     * Build a Fluent Support-compatible payload from parsed email data.
      *
      * @param array $emailData
-     * @return array Formatted payload
+     * @return array
      */
-    private function formatPayload( array $emailData ): array {
-        // Generate unique mime_id if not present
+    public static function buildPayload( array $emailData ): array {
         $mimeId = ! empty( $emailData['message_id'] )
             ? md5( $emailData['message_id'] )
             : md5( uniqid( 'fsep_', true ) );
@@ -109,20 +114,20 @@ class Sender {
             'from'        => $emailData['from'] ?? [],
             'to'          => $emailData['to'] ?? [],
             'cc'          => $emailData['cc'] ?? [],
-            'forwarded'   => $emailData['forwarded'],
-            'attachments' => $this->formatAttachments( $emailData['attachments'] ?? [] ),
+            'forwarded'   => $emailData['forwarded'] ?? null,
+            'attachments' => self::formatAttachments( $emailData['attachments'] ?? [] ),
             'isMarkDown'  => $emailData['isMarkDown'] ?? false,
         ];
     }
 
     /**
-     * Format attachments for webhook
+     * Format attachments for the payload.
      *
      * @param array $attachments
      * @return array
      */
-    private function formatAttachments( array $attachments ): array {
-        return array_map( function ( $attachment ) {
+    private static function formatAttachments( array $attachments ): array {
+        return array_map( static function ( $attachment ) {
             return [
                 'filename'           => $attachment['filename'] ?? 'attachment',
                 'url'                => $attachment['url'] ?? '',
